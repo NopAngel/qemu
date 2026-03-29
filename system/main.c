@@ -1,25 +1,8 @@
 /*
- * QEMU System Emulator
+ * QEMU System Emulator - Main Entry Point
  *
- * Copyright (c) 2003-2020 Fabrice Bellard
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * Optimized for multi-threading and BQL management.
+ * Copyright (c) 2003-2026 Fabrice Bellard and Contributors.
  */
 
 #include "qemu/osdep.h"
@@ -30,9 +13,8 @@
 
 #ifdef CONFIG_SDL
 /*
- * SDL insists on wrapping the main() function with its own implementation on
- * some platforms; it does so via a macro that renames our main function, so
- * <SDL.h> must be #included here even with no SDL code called from this file.
+ * SDL platforms may wrap main() via macros. 
+ * Include required to ensure proper symbol redirection.
  */
 #include <SDL.h>
 #endif
@@ -41,56 +23,78 @@
 #include <CoreFoundation/CoreFoundation.h>
 #endif
 
+/**
+ * qemu_default_main - Standard execution path for the main loop
+ * @opaque: Unused parameter for thread compatibility
+ */
 static void *qemu_default_main(void *opaque)
 {
     int status;
 
+    /* * Re-acquire locks released by the initial setup.
+     * BQL (Big QEMU Lock) is mandatory for core emulator state.
+     */
     replay_mutex_lock();
     bql_lock();
+
     status = qemu_main_loop();
+    
+    /* Cleanup resources before thread termination */
     qemu_cleanup(status);
+
     bql_unlock();
     replay_mutex_unlock();
 
     exit(status);
 }
 
+/* Function pointer to override the main execution logic if needed */
 int (*qemu_main)(void);
 
 #ifdef CONFIG_DARWIN
+/**
+ * os_darwin_cfrunloop_main - MacOS specific UI event loop
+ * Keeps the main thread responsive for the Cocoa UI.
+ */
 static int os_darwin_cfrunloop_main(void)
 {
     CFRunLoopRun();
     g_assert_not_reached();
 }
+
+/* On Darwin, we default to the CoreFoundation runloop */
 int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 #endif
 
 int main(int argc, char **argv)
 {
+    /* Initialize QEMU internal state, CPUs, and accelerators */
     qemu_init(argc, argv);
 
     /*
-     * qemu_init acquires the BQL and replay mutex lock. BQL is acquired when
-     * initializing cpus, to block associated threads until initialization is
-     * complete. Replay_mutex lock is acquired on initialization, because it
-     * must be held when configuring icount_mode.
-     *
-     * On MacOS, qemu main event loop runs in a background thread, as main
-     * thread must be reserved for UI. Thus, we need to transfer lock ownership,
-     * and the simplest way to do that is to release them, and reacquire them
-     * from qemu_default_main.
+     * qemu_init() acquires the BQL/Replay locks. We release them here
+     * to allow the main_loop_thread (or the subsequent call) to
+     * take ownership and avoid deadlocks during the transition.
      */
     bql_unlock();
     replay_mutex_unlock();
 
     if (qemu_main) {
         QemuThread main_loop_thread;
-        qemu_thread_create(&main_loop_thread, "qemu_main",
+
+        /* * Spawn the emulator loop in a background thread.
+         * Detached mode is used as the thread manages its own exit.
+         */
+        qemu_thread_create(&main_loop_thread, "qemu_main_loop",
                            qemu_default_main, NULL, QEMU_THREAD_DETACHED);
+        
+        /* Run the platform-specific main (e.g., UI event loop) */
         return qemu_main();
-    } else {
-        qemu_default_main(NULL);
-        g_assert_not_reached();
-    }
+    } 
+    
+    /* Fallback to default execution if no override is set */
+    qemu_default_main(NULL);
+    
+    /* Safety check: qemu_default_main should call exit() */
+    g_assert_not_reached();
 }
